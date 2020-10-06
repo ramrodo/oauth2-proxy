@@ -12,13 +12,15 @@ import (
 	"github.com/pusher/oauth2_proxy/pkg/apis/sessions"
 	"github.com/pusher/oauth2_proxy/pkg/cookies"
 	"github.com/pusher/oauth2_proxy/pkg/encryption"
+	"github.com/pusher/oauth2_proxy/pkg/logger"
 	"github.com/pusher/oauth2_proxy/pkg/sessions/utils"
 )
 
 const (
-	// Cookies are limited to 4kb including the length of the cookie name,
-	// the cookie name can be up to 256 bytes
-	maxCookieLength = 3840
+	// Cookies are limited to 4kb for all parts
+	// including the cookie name, value, attributes; IE (http.cookie).String()
+	// Most browsers' max is 4096 -- but we give ourselves some leeway
+	maxCookieLength = 4000
 )
 
 // Ensure CookieSessionStore implements the interface
@@ -51,11 +53,11 @@ func (s *SessionStore) Load(req *http.Request) (*sessions.SessionState, error) {
 	c, err := loadCookie(req, s.CookieOptions.CookieName)
 	if err != nil {
 		// always http.ErrNoCookie
-		return nil, fmt.Errorf("Cookie %q not present", s.CookieOptions.CookieName)
+		return nil, fmt.Errorf("cookie %q not present", s.CookieOptions.CookieName)
 	}
 	val, _, ok := encryption.Validate(c, s.CookieOptions.CookieSecret, s.CookieOptions.CookieExpire)
 	if !ok {
-		return nil, errors.New("Cookie Signature not valid")
+		return nil, errors.New("cookie signature not valid")
 	}
 
 	session, err := utils.SessionFromCookie(val, s.CookieCipher)
@@ -99,7 +101,8 @@ func (s *SessionStore) makeSessionCookie(req *http.Request, value string, now ti
 		value = encryption.SignedValue(s.CookieOptions.CookieSecret, s.CookieOptions.CookieName, value, now)
 	}
 	c := s.makeCookie(req, s.CookieOptions.CookieName, value, s.CookieOptions.CookieExpire, now)
-	if len(c.Value) > 4096-len(s.CookieOptions.CookieName) {
+
+	if len(c.String()) > maxCookieLength {
 		return splitCookie(c)
 	}
 	return []*http.Cookie{c}
@@ -129,27 +132,44 @@ func NewCookieSessionStore(opts *options.SessionOptions, cookieOpts *options.Coo
 // it into a slice of cookies which fit within the 4kb cookie limit indexing
 // the cookies from 0
 func splitCookie(c *http.Cookie) []*http.Cookie {
-	if len(c.Value) < maxCookieLength {
+	if len(c.String()) < maxCookieLength {
 		return []*http.Cookie{c}
 	}
+
+	logger.Printf("WARNING: Multiple cookies are required for this session as it exceeds the 4kb cookie limit. Please use server side session storage (eg. Redis) instead.")
+
 	cookies := []*http.Cookie{}
 	valueBytes := []byte(c.Value)
 	count := 0
 	for len(valueBytes) > 0 {
 		newCookie := copyCookie(c)
-		newCookie.Name = fmt.Sprintf("%s_%d", c.Name, count)
+		newCookie.Name = splitCookieName(c.Name, count)
 		count++
-		if len(valueBytes) < maxCookieLength {
-			newCookie.Value = string(valueBytes)
+
+		newCookie.Value = string(valueBytes)
+		cookieLength := len(newCookie.String())
+		if cookieLength <= maxCookieLength {
 			valueBytes = []byte{}
 		} else {
-			newValue := valueBytes[:maxCookieLength]
-			valueBytes = valueBytes[maxCookieLength:]
+			overflow := cookieLength - maxCookieLength
+			valueSize := len(valueBytes) - overflow
+
+			newValue := valueBytes[:valueSize]
+			valueBytes = valueBytes[valueSize:]
 			newCookie.Value = string(newValue)
 		}
 		cookies = append(cookies, newCookie)
 	}
 	return cookies
+}
+
+func splitCookieName(name string, count int) string {
+	splitName := fmt.Sprintf("%s_%d", name, count)
+	overflow := len(splitName) - 256
+	if overflow > 0 {
+		splitName = fmt.Sprintf("%s_%d", name[:len(name)-overflow], count)
+	}
+	return splitName
 }
 
 // loadCookie retreieves the sessions state cookie from the http request.
@@ -165,14 +185,14 @@ func loadCookie(req *http.Request, cookieName string) (*http.Cookie, error) {
 	count := 0
 	for err == nil {
 		var c *http.Cookie
-		c, err = req.Cookie(fmt.Sprintf("%s_%d", cookieName, count))
+		c, err = req.Cookie(splitCookieName(cookieName, count))
 		if err == nil {
 			cookies = append(cookies, c)
 			count++
 		}
 	}
 	if len(cookies) == 0 {
-		return nil, fmt.Errorf("Could not find cookie %s", cookieName)
+		return nil, fmt.Errorf("could not find cookie %s", cookieName)
 	}
 	return joinCookies(cookies)
 }
